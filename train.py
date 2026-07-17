@@ -119,12 +119,7 @@ def main():
 
     args.db = ensure_db(args.db)
 
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")  # Apple Silicon GPU via Metal
-    else:
-        device = torch.device("cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"using device: {device}")
 
     train_ds, eval_ds, grid = build_datasets(
