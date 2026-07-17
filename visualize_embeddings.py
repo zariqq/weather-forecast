@@ -30,6 +30,7 @@ from sklearn.manifold import TSNE
 from torch.utils.data import DataLoader
 
 from dataset import DB, Era5WindowDataset, load_profile_grid
+from download_data import ensure_db
 from jepa_model import WeatherJEPA, HORIZON_TO_IDX
 from train import collate
 
@@ -53,6 +54,8 @@ def main():
     ap.add_argument("--max-samples", type=int, default=1500)
     ap.add_argument("--out-prefix", default="embeddings")
     args = ap.parse_args()
+
+    args.db = ensure_db(args.db)
 
     if torch.cuda.is_available():
         device = torch.device("cuda")

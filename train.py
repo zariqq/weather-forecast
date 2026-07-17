@@ -24,6 +24,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from dataset import build_datasets, HORIZON_HOURS, TARGET_CHANNEL_IDX
+from download_data import ensure_db
 from jepa_model import WeatherJEPA, jepa_and_forecast_loss
 
 
@@ -115,6 +116,8 @@ def main():
     ap.add_argument("--ckpt", default="weather_jepa.pt")
     ap.add_argument("--metrics-out", default="rmse_metrics.json")
     args = ap.parse_args()
+
+    args.db = ensure_db(args.db)
 
     if torch.cuda.is_available():
         device = torch.device("cuda")
