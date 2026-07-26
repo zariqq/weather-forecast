@@ -1,13 +1,16 @@
 from enum import Enum
 
+
 class Category(Enum):
     CLOUDLESS = 0
     HIGH_LEVEL_CLOUD = 1
     LOW_SIGNAL = 2
 
+
 class Channel(Enum):
-    MAIN     = 1
+    MAIN = 1
     PARALLEL = 2
+
 
 class Measure(Enum):
     PRESSURE = 1
@@ -17,21 +20,23 @@ class Measure(Enum):
     WIND_DIRECTION = 5
     WIND_SPEED = 6
 
+
 def measure_to_graph(m: Measure):
     if m == Measure.PRESSURE:
         return "Pressure", "hPa"
     elif m == Measure.TEMPERATURE:
-        return "Temperature", "$C^{\circ}$"
+        return "Temperature", r"$C^{\circ}$"
     elif m == Measure.REL_HUMIDITY:
         return "Relative Humidity", "%"
     elif m == Measure.ABS_HUMIDITY:
         return "Absolute Humidity", "kg/kg"
     elif m == Measure.WIND_DIRECTION:
-        return "Wind Direction", "$^{\circ}$"
+        return "Wind Direction", r"$^{\circ}$"
     elif m == Measure.WIND_SPEED:
         return "Wind Speed", "m/s"
     else:
         raise Exception(m)
+
 
 def collection_to_label(path: str):
     # Я помню про существование match
@@ -81,6 +86,8 @@ def collection_to_label(path: str):
         return "Wind Tendencies / Total northward wind analysis tendency [m/s]"
 
     if path == "M2T3NPQDT:tavg3_3d_qdt_Np/DQVDTANA":
-        return "Moist Tendencies / Total specific humidity analysis tendency [kg / (ks*s)]"
+        return (
+            "Moist Tendencies / Total specific humidity analysis tendency [kg / (ks*s)]"
+        )
 
     assert False, "Unknown path!"

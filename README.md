@@ -1,87 +1,66 @@
-# WeatherJEPA — short-term ERA5 profile forecasting with a JEPA backbone
+# WeatherJEPA
 
-Built on top of the existing `consts.py` / `pylidlight.py` DB layer. Copy
-those two files into this folder (unchanged) before running anything here.
+Short-term ERA5 absolute humidity forecasting with a Joint-Embedding Predictive Architecture (JEPA). 3h and 6h horizons, 37 pressure levels.
 
 ## Files
 
-| File | Role |
-|---|---|
-| `dataset.py` | Pulls ERA5 profiles from `DB` onto a fixed pressure-level grid, builds windowed context/target samples (24h context by default, 3h & 6h targets), standardizes with train-only statistics. |
-| `jepa_model.py` | `WeatherJEPA`: context encoder, EMA target encoder, horizon-conditioned predictor, forecast head. |
-| `train.py` | Training loop + per-pressure-level RMSE evaluation over a caller-specified date range. |
-| `visualize_embeddings.py` | PCA / t-SNE / cosine-similarity plots of extracted embeddings, for the latent-space analysis slide. |
+| File                      | Purpose                                                                                                   |
+| ------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `train.py`                | Training loop + mid-training eval + best checkpoint saving                                                |
+| `eval.py`                 | Standalone inference: RMSE per pressure level + embedding extraction (for the committee)                  |
+| `jepa_model.py`           | Transformer-based JEPA: context encoder, EMA target encoder, horizon-conditioned predictor, forecast head |
+| `dataset.py`              | ERA5 data loading: pressure grid discovery, windowed context/target samples, standardization              |
+| `visualize_embeddings.py` | PCA / t-SNE / cosine-similarity plots of extracted embeddings                                             |
+| `download_data.py`        | Downloads the SQLite DB from Google Drive                                                                 |
+| `dblayer/`                | DB access layer (`consts.py`, `pylidlight.py` -- provided, not mine)                                       |
 
-## How this maps to the assignment
-
-- **§1 Data prep** — `dataset.load_profile_grid` + `Era5WindowDataset` build
-  the labeled time-series dataset from ERA5 reanalysis, on a shared
-  pressure-level grid discovered from the archive itself.
-- **§2 Architecture** — `WeatherJEPA` is a Transformer-based JEPA: a
-  context encoder over the past 24h of profiles, an EMA target encoder
-  (stop-gradient, avoids representation collapse) over the true future
-  profile, and a horizon-conditioned predictor trained in *representation
-  space* rather than raw value space. This is the "self-designed
-  architecture with justified layer choice" the committee is grading —
-  the writeup in the model docstring covers the *why*.
-- **§3 Evaluation** — `train.evaluate` computes RMSE **per pressure
-  level**, separately for the 3h and 6h horizons, in physical units
-  (de-standardized), on whatever `--eval-start/--eval-end` range is
-  passed at the CLI. That's the hook the committee needs to re-point
-  evaluation at the closed test window.
-- **§4 Embedding extraction** — `WeatherJEPA.forward` and
-  `train.extract_embedding` both expose `z_hat`: the vector produced by
-  the predictor, immediately before `ForecastHead` (the "final
-  prognostic layer"). Its dimensionality is a single CLI flag
-  (`--embed-dim`), so leaderboard tuning for the smallest usable
-  embedding is just a sweep over that one number.
-
-## Running it
+## Quick start
 
 ```bash
+# Train
 python train.py \
-  --db ./era5.sqlite --place "Lidar(Tomsk)" \
+  --db ./era5.db --place "Lidar(Tomsk)" \
   --train-start 2009-01-01 --train-end 2021-12-31 \
   --eval-start  2022-01-01 --eval-end  2023-12-31 \
-  --ctx-len 8 --embed-dim 64 --epochs 30
+  --embed-dim 64 --epochs 30
 
-python visualize_embeddings.py \
-  --db ./era5.sqlite --place "Lidar(Tomsk)" --ckpt weather_jepa.pt \
-  --eval-start 2022-01-01 --eval-end 2023-12-31 --horizon 3
+# Evaluate on any date range (no training)
+python eval.py \
+  --db ./era5.db --place "Lidar(Tomsk)" \
+  --ckpt weather_jepa.pt \
+  --eval-start 2024-01-01 --eval-end 2024-12-31 \
+  --save-embeddings embeddings.npz
 ```
 
-`train.py` writes `rmse_metrics.json` (per-level RMSE arrays for both
-horizons, aligned with `pressure_levels_hPa`) and `weather_jepa.pt`
-(model weights + normalization stats + the pressure grid, so the
-checkpoint is self-contained for the committee's closed-set run).
+## Architecture
 
-## Assumptions you'll need to double check against the actual DB
+Context (past 8h of T/RH/AH/wind profiles) -> Transformer encoder -> pooled embedding `z_ctx`. Predictor `g_phi` maps `z_ctx` -> `z_hat` (conditioned on horizon 3h/6h via learned embedding). Forecast head decodes `z_hat` -> absolute humidity profile.
 
-1. **Place name.** `TZ` in `pylidlight.py` only lists `"Lidar(Tomsk)"`.
-   If your ERA5 rows live under a different `Place.name`, either add it
-   to `TZ` or ignore — ERA5 timestamps here are read straight off
-   `Era5Data.timestamp` (UTC), not through the lidar-specific `TZ` map.
-2. **Native cadence.** `STEP_SECONDS = 3*3600` assumes 3-hourly ERA5
-   steps (standard for this kind of MERRA2/ERA5-style archive). If your
-   archive is hourly, change `STEP_SECONDS` and `HORIZON_STEPS`
-   accordingly (horizons should stay 3h/6h; step counts change).
-3. **Pressure grid discovery.** The grid is read from the `PRESSURE`
-   field of the *first* available timestep and reused for every other
-   variable via `get_era5_measurements(..., altitude=list(grid))`
-   (which interpolates onto it). If pressure levels are actually
-   time-invariant in the archive (typical for reanalysis), this is
-   exact rather than approximate.
-4. **No network/DB in this sandbox**, so this code is syntax-checked
-   (`python -m py_compile`) but not execution-tested against real data
-   or a real `torch` install — sanity-check shapes on a small date
-   range before a full training run.
+Target encoder is an EMA copy of the context encoder (no gradients). JEPA loss: `||z_hat - stopgrad(z_target)||^2` in representation space. Forecast loss: MSE on the decoded humidity profile.
 
-## Tuning knobs likely worth sweeping for the leaderboard
+The extracted "hidden context vector" is `z_hat` -- right before the forecast head.
 
-- `--embed-dim`: leaderboard rewards small embeddings; watch the
-  RMSE/dim tradeoff in `rmse_metrics.json` across a sweep (e.g. 16/32/64/128).
-- `--jepa-weight` / `--forecast-weight`: too much forecast weight turns
-  this into a plain supervised model (embedding becomes less
-  interesting); too much JEPA weight can undertrain the decode head.
-- `--ctx-len`: longer context helps the diurnal cycle but costs
-  quadratic attention time; 8 steps (24h) is a reasonable default start.
+## Key CLI flags
+
+| Flag                                  | What                                                                          |
+| ------------------------------------- | ----------------------------------------------------------------------------- |
+| `--embed-dim`                         | Embedding size. Smaller = better leaderboard. Sweep 16/32/64                  |
+| `--jepa-weight` / `--forecast-weight` | Loss ratio. If embeddings collapse (cosine > 0.9), raise jepa, lower forecast |
+| `--eval-every N`                      | Eval frequency during training                                                |
+| `--ckpt-best`                         | Auto-saves when eval RMSE improves                                            |
+
+## Data
+
+ERA5 reanalysis 2009–2023, Lidar(Tomsk). 123,769 hourly timesteps, 37 pressure levels (0–458 hPa). Variables: temperature, relative humidity, absolute humidity, wind direction/speed. Target: absolute humidity.
+
+Native cadence is auto-detected (hourly in this DB). Horizons: 3 steps (3h) and 6 steps (6h).
+
+## Checkpoint format
+
+Self-contained `.pt` file:
+
+```
+model_state, mean, std, pressure_levels, args, epoch, eval_rmse_mean
+```
+
+Everything needed for inference without access to the original training code.
