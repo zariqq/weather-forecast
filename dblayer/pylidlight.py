@@ -187,15 +187,7 @@ class DB:
     def get_era5_measurements_approx(
         self, place: Place, measure: Measure, timestamp: int, *, altitudes: list[float]
     ):
-        """
-        Получить данные реанализа приблизительно через линейную интерполяцию соседних измерений
-        в любой момент времени (timestamp) и для заданного набора высот (altitudes)
-
-        altitude - любой массив высот
-        """
-        timestamp = int(
-            timestamp
-        )  # Для того, чтобы избежать странных проблем из-за numpy
+        timestamp = int(timestamp)
         first = None
         second = None
 

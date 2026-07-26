@@ -113,7 +113,11 @@ def main():
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--jepa-weight", type=float, default=1.0)
     ap.add_argument("--forecast-weight", type=float, default=1.0)
+    ap.add_argument("--eval-every", type=int, default=1,
+                    help="Run eval every N epochs (default: 1 = every epoch)")
     ap.add_argument("--ckpt", default="weather_jepa.pt")
+    ap.add_argument("--ckpt-best", default="weather_jepa_best.pt",
+                    help="Separate checkpoint for best eval RMSE")
     ap.add_argument("--metrics-out", default="rmse_metrics.json")
     args = ap.parse_args()
 
@@ -167,9 +171,13 @@ def main():
         weight_decay=1e-4,
     )
 
+    best_eval_rmse = float("inf")
     loss_history = []
     for epoch in range(args.epochs):
+        # ---- train ----
+        model.train()
         running = {"jepa": 0.0, "forecast": 0.0}
+        running_per_h = {h: 0.0 for h in HORIZON_HOURS}
         n_batches = 0
         for context, future_full, targets, _raw in train_loader:
             context = context.to(device)
@@ -189,16 +197,67 @@ def main():
 
             running["jepa"] += parts["jepa"].item()
             running["forecast"] += parts["forecast"].item()
+            for h in HORIZON_HOURS:
+                running_per_h[h] += parts["per_horizon"][h].item()
             n_batches += 1
 
         avg_jepa = running["jepa"] / max(n_batches, 1)
         avg_fcst = running["forecast"] / max(n_batches, 1)
-        loss_history.append(
-            {"epoch": epoch, "jepa_loss": avg_jepa, "forecast_loss": avg_fcst}
+        avg_per_h = {h: running_per_h[h] / max(n_batches, 1) for h in HORIZON_HOURS}
+
+        # ---- eval (every N epochs + final epoch) ----
+        run_eval = (args.eval_every > 0 and (epoch + 1) % args.eval_every == 0) or (epoch == args.epochs - 1)
+        eval_rmse = {}
+        eval_mean = {}
+        if run_eval:
+            eval_rmse = evaluate(model, eval_loader, eval_ds.mean, eval_ds.std, device)
+            eval_mean = {h: float(eval_rmse[h].mean()) for h in HORIZON_HOURS}
+
+        # ---- best checkpoint ----
+        if run_eval:
+            avg_eval = float(np.mean([eval_mean[h] for h in HORIZON_HOURS]))
+            if avg_eval < best_eval_rmse:
+                best_eval_rmse = avg_eval
+                torch.save(
+                    {
+                        "model_state": model.state_dict(),
+                        "mean": train_ds.mean,
+                        "std": train_ds.std,
+                        "pressure_levels": grid.pressure_levels,
+                        "args": vars(args),
+                        "epoch": epoch,
+                        "eval_rmse_mean": eval_mean,
+                    },
+                    args.ckpt_best,
+                )
+                is_best = " *"
+            else:
+                is_best = ""
+        else:
+            is_best = ""
+
+        # ---- log ----
+        loss_history.append({
+            "epoch": epoch,
+            "jepa_loss": avg_jepa,
+            "forecast_loss": avg_fcst,
+            **{f"forecast_loss_{h}h": avg_per_h[h] for h in HORIZON_HOURS},
+            **({f"eval_rmse_{h}h": eval_mean[h] for h in HORIZON_HOURS} if run_eval else {}),
+        })
+
+        train_part = (
+            f"jepa={avg_jepa:.5f}  "
+            + "  ".join(f"fcst_{h}h={avg_per_h[h]:.5f}" for h in HORIZON_HOURS)
         )
-        print(
-            f"epoch {epoch:03d}  jepa_loss={avg_jepa:.5f}  forecast_loss={avg_fcst:.5f}"
-        )
+        eval_part = ""
+        if run_eval:
+            eval_part = (
+                " | eval "
+                + "  ".join(f"RMSE_{h}h={eval_mean[h]:.5f}" for h in HORIZON_HOURS)
+                + f"  (avg={avg_eval:.5f})"
+                + is_best
+            )
+        print(f"epoch {epoch:03d}  {train_part}{eval_part}")
 
     rmse = evaluate(model, eval_loader, eval_ds.mean, eval_ds.std, device)
     results = {
@@ -223,8 +282,13 @@ def main():
         args.ckpt,
     )
 
+    results["best_eval_rmse_mean"] = float(best_eval_rmse) if best_eval_rmse < float("inf") else None
+
+    print("\n=== Final results ===")
     print("Mean RMSE by horizon (kg/kg):", results["rmse_mean_by_horizon"])
-    print(f"Saved checkpoint to {args.ckpt}, metrics to {args.metrics_out}")
+    if results["best_eval_rmse_mean"] is not None:
+        print(f"Best eval RMSE (avg across horizons): {results['best_eval_rmse_mean']:.5f}  -> {args.ckpt_best}")
+    print(f"Last checkpoint -> {args.ckpt}, metrics -> {args.metrics_out}")
 
 
 if __name__ == "__main__":
