@@ -199,7 +199,7 @@ class WeatherJEPA(nn.Module):
                 y = future_full[hours].unsqueeze(1)                 # [B, 1, L, C]
                 z_target = self.target_encoder(y)                   # [B, D], stopgrad by construction
 
-            forecast = self.forecast_head(z_hat)                    # [B, L]
+            forecast = self.forecast_head(z_hat.detach())           # [B, L] — detached: forecast loss shapes the head, not the embedding
 
             out["per_horizon"][hours] = {
                 "z_hat": z_hat,
