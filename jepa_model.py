@@ -203,18 +203,27 @@ class WeatherJEPA(nn.Module):
         return out
 
 
+def variance_loss(z: torch.Tensor, target_std: float = 0.5) -> torch.Tensor:
+    """Penalize per-dimension std below target_std. Prevents all embeddings
+    from collapsing into a narrow cone where every dimension is near-zero."""
+    std = torch.sqrt(z.var(dim=0) + 1e-6)
+    return torch.mean(torch.relu(target_std - std))
+
+
 def jepa_and_forecast_loss(model_out: dict, targets: dict[int, torch.Tensor],
-                            jepa_weight: float = 1.0, forecast_weight: float = 1.0):
+                            jepa_weight: float = 1.0, forecast_weight: float = 1.0,
+                            anti_collapse_weight: float = 0.0):
     """
     Combines:
       - representation-space JEPA loss: ||z_hat - stopgrad(z_target)||^2
       - value-space forecast loss: MSE(decoded profile, true standardized profile)
+      - anti-collapse variance loss: pushes per-dim std above target_std
 
     Both losses share the same predictor output z_hat, so the embedding
     is pulled toward being both (a) predictive of the true future
     representation and (b) decodable into an accurate physical forecast.
     """
-    total_jepa, total_fcst = 0.0, 0.0
+    total_jepa, total_fcst, total_var = 0.0, 0.0, 0.0
     per_horizon_fcst = {}
     for hours, d in model_out["per_horizon"].items():
         jepa_term = nn.functional.mse_loss(d["z_hat"], d["z_target"])
@@ -222,6 +231,14 @@ def jepa_and_forecast_loss(model_out: dict, targets: dict[int, torch.Tensor],
         total_jepa = total_jepa + jepa_term
         total_fcst = total_fcst + fcst_term
         per_horizon_fcst[hours] = fcst_term.detach()
+        if anti_collapse_weight > 0:
+            total_var = total_var + variance_loss(d["z_hat"])
 
-    loss = jepa_weight * total_jepa + forecast_weight * total_fcst
-    return loss, {"jepa": total_jepa.detach(), "forecast": total_fcst.detach(), "per_horizon": per_horizon_fcst}
+    loss = jepa_weight * total_jepa + forecast_weight * total_fcst + anti_collapse_weight * total_var
+    parts = {
+        "jepa": total_jepa.detach(),
+        "forecast": total_fcst.detach(),
+        "variance": total_var.detach() if isinstance(total_var, torch.Tensor) else torch.tensor(0.0),
+        "per_horizon": per_horizon_fcst,
+    }
+    return loss, parts

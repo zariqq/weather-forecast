@@ -113,6 +113,10 @@ def main():
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--jepa-weight", type=float, default=1.0)
     ap.add_argument("--forecast-weight", type=float, default=1.0)
+    ap.add_argument("--anti-collapse-weight", type=float, default=0.0,
+                    help="Variance regularization on embeddings. Try 0.05-0.2 if cosine sim > 0.9")
+    ap.add_argument("--ema-momentum", type=float, default=0.996,
+                    help="Target encoder EMA momentum. Lower = faster update, harder JEPA task. Try 0.99")
     ap.add_argument("--eval-every", type=int, default=1,
                     help="Run eval every N epochs (default: 1 = every epoch)")
     ap.add_argument("--ckpt", default="weather_jepa.pt")
@@ -161,6 +165,7 @@ def main():
         n_heads=args.n_heads,
         n_layers=args.n_layers,
         max_ctx_len=args.ctx_len,
+        ema_momentum=args.ema_momentum,
     ).to(device)
 
     opt = torch.optim.AdamW(
@@ -176,7 +181,7 @@ def main():
     for epoch in range(args.epochs):
         # ---- train ----
         model.train()
-        running = {"jepa": 0.0, "forecast": 0.0}
+        running = {"jepa": 0.0, "forecast": 0.0, "variance": 0.0}
         running_per_h = {h: 0.0 for h in HORIZON_HOURS}
         n_batches = 0
         for context, future_full, targets, _raw in train_loader:
@@ -186,7 +191,8 @@ def main():
 
             out = model(context, future_full)
             loss, parts = jepa_and_forecast_loss(
-                out, targets, args.jepa_weight, args.forecast_weight
+                out, targets, args.jepa_weight, args.forecast_weight,
+                anti_collapse_weight=args.anti_collapse_weight,
             )
 
             opt.zero_grad()
@@ -197,12 +203,14 @@ def main():
 
             running["jepa"] += parts["jepa"].item()
             running["forecast"] += parts["forecast"].item()
+            running["variance"] += parts["variance"].item()
             for h in HORIZON_HOURS:
                 running_per_h[h] += parts["per_horizon"][h].item()
             n_batches += 1
 
         avg_jepa = running["jepa"] / max(n_batches, 1)
         avg_fcst = running["forecast"] / max(n_batches, 1)
+        avg_var = running["variance"] / max(n_batches, 1)
         avg_per_h = {h: running_per_h[h] / max(n_batches, 1) for h in HORIZON_HOURS}
 
         # ---- eval (every N epochs + final epoch) ----
@@ -241,6 +249,7 @@ def main():
             "epoch": epoch,
             "jepa_loss": avg_jepa,
             "forecast_loss": avg_fcst,
+            "variance_loss": avg_var,
             **{f"forecast_loss_{h}h": avg_per_h[h] for h in HORIZON_HOURS},
             **({f"eval_rmse_{h}h": eval_mean[h] for h in HORIZON_HOURS} if run_eval else {}),
         })
@@ -249,6 +258,8 @@ def main():
             f"jepa={avg_jepa:.5f}  "
             + "  ".join(f"fcst_{h}h={avg_per_h[h]:.5f}" for h in HORIZON_HOURS)
         )
+        if args.anti_collapse_weight > 0:
+            train_part += f"  var={avg_var:.5f}"
         eval_part = ""
         if run_eval:
             eval_part = (
