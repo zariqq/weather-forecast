@@ -104,16 +104,22 @@ class ProfileEncoder(nn.Module):
 
 class HorizonPredictor(nn.Module):
     """g_phi: predicts the target embedding from the context embedding,
-    conditioned on which horizon (3h vs 6h) is being predicted."""
+    conditioned on which horizon (3h vs 6h) is being predicted.
 
-    def __init__(self, embed_dim: int = 128, n_horizons: int = 2, hidden: int = 256):
+    Uses a bottleneck architecture (hidden <= embed_dim) per I-JEPA practice."""
+
+    def __init__(self, embed_dim: int = 128, n_horizons: int = 2, hidden: int | None = None):
         super().__init__()
+        if hidden is None:
+            hidden = embed_dim  # bottleneck: no expansion
         self.horizon_embed = nn.Embedding(n_horizons, embed_dim)
         self.net = nn.Sequential(
             nn.Linear(embed_dim * 2, hidden),
             nn.GELU(),
+            nn.Dropout(0.1),
             nn.Linear(hidden, hidden),
             nn.GELU(),
+            nn.Dropout(0.1),
             nn.Linear(hidden, embed_dim),
         )
 
@@ -215,18 +221,18 @@ def jepa_and_forecast_loss(model_out: dict, targets: dict[int, torch.Tensor],
                             anti_collapse_weight: float = 0.0):
     """
     Combines:
-      - representation-space JEPA loss: ||z_hat - stopgrad(z_target)||^2
+      - representation-space JEPA loss: MSE on L2-normalized embeddings
+        (||z_hat_norm - stopgrad(z_target_norm)||^2). Normalization forces
+        angular diversity — embeddings can't all point the same way.
       - value-space forecast loss: MSE(decoded profile, true standardized profile)
       - anti-collapse variance loss: pushes per-dim std above target_std
-
-    Both losses share the same predictor output z_hat, so the embedding
-    is pulled toward being both (a) predictive of the true future
-    representation and (b) decodable into an accurate physical forecast.
     """
     total_jepa, total_fcst, total_var = 0.0, 0.0, 0.0
     per_horizon_fcst = {}
     for hours, d in model_out["per_horizon"].items():
-        jepa_term = nn.functional.mse_loss(d["z_hat"], d["z_target"])
+        z_hat_norm = nn.functional.normalize(d["z_hat"], dim=-1)
+        z_target_norm = nn.functional.normalize(d["z_target"], dim=-1)
+        jepa_term = nn.functional.mse_loss(z_hat_norm, z_target_norm)
         fcst_term = nn.functional.mse_loss(d["forecast"], targets[hours])
         total_jepa = total_jepa + jepa_term
         total_fcst = total_fcst + fcst_term
