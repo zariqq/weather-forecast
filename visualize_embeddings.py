@@ -27,12 +27,10 @@ import numpy as np
 import torch
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
-from torch.utils.data import DataLoader
 
 from dataset import DB, Era5WindowDataset, load_profile_grid
 from download_data import ensure_db
 from jepa_model import WeatherJEPA, HORIZON_TO_IDX
-from train import collate
 
 
 def to_ts(s):
@@ -52,8 +50,10 @@ def main():
     ap.add_argument("--eval-end", required=True)
     ap.add_argument("--horizon", type=int, default=3, choices=[3, 6])
     ap.add_argument("--max-samples", type=int, default=5000)
-    ap.add_argument("--shuffle/--no-shuffle", default=True,
-                    help="Randomly subsample across full eval range (default: on)")
+    ap.add_argument("--shuffle", action="store_true", default=True,
+                    help="Randomly subsample across full eval range")
+    ap.add_argument("--no-shuffle", action="store_false", dest="shuffle",
+                    help="Take first N samples (fast debug)")
     ap.add_argument("--out-prefix", default="embeddings")
     args = ap.parse_args()
 
@@ -76,8 +76,6 @@ def main():
         mean=ckpt["mean"],
         std=ckpt["std"],
     )
-    loader = DataLoader(ds, batch_size=64, shuffle=False, collate_fn=collate)
-
     n_channels = grid.values.shape[-1]
     n_levels = len(grid.pressure_levels)
     model = WeatherJEPA(
@@ -125,12 +123,7 @@ def main():
                 )
 
     embeds = np.concatenate(embeds, axis=0)[:n_use]
-    months = np.array(
-        [
-            datetime.datetime.fromtimestamp(t, tz=datetime.timezone.utc).month
-            for t in sample_timestamps
-        ]
-    )
+    months = np.array(months)
 
     # --- PCA ---
     pca = PCA(n_components=2)
