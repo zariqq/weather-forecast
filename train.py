@@ -46,8 +46,8 @@ def evaluate(model, loader, mean, std, device):
     model.eval()
     sq_err = {h: None for h in HORIZON_HOURS}
     count = 0
-    tgt_mean = mean[TARGET_CHANNEL_IDX]
-    tgt_std = std[TARGET_CHANNEL_IDX]
+    tgt_mean = mean[:, TARGET_CHANNEL_IDX]   # (L,) per-level
+    tgt_std = std[:, TARGET_CHANNEL_IDX]     # (L,) per-level
 
     for context, future_full, _targets, raw_targets in loader:
         context = context.to(device)

@@ -120,10 +120,15 @@ def load_profile_grid(db: DB, place: Place) -> ProfileGrid:
     )
 
 
-def _channel_stats(values: np.ndarray):
-    """Per-channel mean/std over valid (non-nan) entries, for standardization."""
-    mean = np.nanmean(values, axis=(0, 1))
-    std = np.nanstd(values, axis=(0, 1))
+def _level_stats(values: np.ndarray):
+    """Per-level, per-channel mean/std over time axis.
+
+    Returns arrays of shape (L, C). Each pressure level is standardized
+    independently so upper-atmosphere structure (where humidity is ~1e-6 kg/kg)
+    carries equal weight in the loss to surface structure (~0.01 kg/kg).
+    """
+    mean = np.nanmean(values, axis=0)   # (L, C)
+    std = np.nanstd(values, axis=0)     # (L, C)
     std[std < 1e-6] = 1.0
     return mean.astype(np.float32), std.astype(np.float32)
 
@@ -150,7 +155,7 @@ class Era5WindowDataset(Dataset):
         self.grid = grid
         self.ctx_len = ctx_len
         self.mean, self.std = (
-            (mean, std) if mean is not None else _channel_stats(grid.values)
+            (mean, std) if mean is not None else _level_stats(grid.values)
         )
 
         # Derive step counts for each horizon from THIS grid's own detected
@@ -221,12 +226,14 @@ class Era5WindowDataset(Dataset):
         t = self.index[i]
         g = self.grid
         ctx = g.values[t - self.ctx_len + 1 : t + 1]  # [ctx_len, L, C]
-        ctx_std = (ctx - self.mean) / self.std
+        ctx_std = (ctx - self.mean) / self.std        # mean/std shape (L, C) broadcasts
 
+        tgt_mean = self.mean[:, TARGET_CHANNEL_IDX]    # (L,)
+        tgt_std  = self.std[:, TARGET_CHANNEL_IDX]     # (L,)
         targets, raw_targets = {}, {}
         for hours, step in self.horizon_steps.items():
             raw = g.values[t + step, :, TARGET_CHANNEL_IDX]  # [L]
-            std = (raw - self.mean[TARGET_CHANNEL_IDX]) / self.std[TARGET_CHANNEL_IDX]
+            std = (raw - tgt_mean) / tgt_std
             targets[hours] = torch.from_numpy(std.astype(np.float32))
             raw_targets[hours] = torch.from_numpy(raw.astype(np.float32))
 
