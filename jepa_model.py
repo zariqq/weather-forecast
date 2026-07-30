@@ -79,6 +79,7 @@ class ProfileEncoder(nn.Module):
         self.level_pos = SinusoidalLevelEmbedding(embed_dim, max_len=n_levels + 1)
         self.time_pos = nn.Embedding(max_ctx_len, embed_dim)
         self.cls = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
+        self.mask_token = nn.Parameter(torch.randn(1, 1, 1, embed_dim) * 0.02)
 
         layer = nn.TransformerEncoderLayer(
             d_model=embed_dim, nhead=n_heads, dim_feedforward=embed_dim * 4,
@@ -87,12 +88,19 @@ class ProfileEncoder(nn.Module):
         self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
         self.norm = nn.LayerNorm(embed_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask_ratio: float = 0.0) -> torch.Tensor:
         # x: [B, T, L, C]  (a single future profile arrives as T=1)
         B, T, L, C = x.shape
         tok = self.level_proj(x)                                  # [B, T, L, D]
         tok = tok + self.level_pos(L).view(1, 1, L, -1)
         tok = tok + self.time_pos(torch.arange(T, device=x.device)).view(1, T, 1, -1)
+
+        # Random token masking at training time: force predictor to
+        # work from partial views so it can't shortcut.
+        if self.training and mask_ratio > 0:
+            mask = torch.rand(B, T, L, 1, device=x.device) < mask_ratio
+            tok = torch.where(mask, self.mask_token, tok)
+
         tok = tok.reshape(B, T * L, self.embed_dim)                # flatten to a token sequence
 
         cls = self.cls.expand(B, -1, -1)
@@ -150,8 +158,9 @@ HORIZON_TO_IDX = {3: 0, 6: 1}
 class WeatherJEPA(nn.Module):
     def __init__(self, n_channels: int, n_levels: int, embed_dim: int = 128,
                  n_heads: int = 4, n_layers: int = 3, max_ctx_len: int = 16,
-                 ema_momentum: float = 0.996):
+                 ema_momentum: float = 0.996, ctx_mask_ratio: float = 0.0):
         super().__init__()
+        self.ctx_mask_ratio = ctx_mask_ratio
         self.context_encoder = ProfileEncoder(
             n_channels, n_levels, embed_dim, n_heads, n_layers, max_ctx_len
         )
@@ -172,10 +181,10 @@ class WeatherJEPA(nn.Module):
         for b_t, b_c in zip(self.target_encoder.buffers(), self.context_encoder.buffers()):
             b_t.data.copy_(b_c.data)
 
-    def encode_context(self, context: torch.Tensor) -> torch.Tensor:
+    def encode_context(self, context: torch.Tensor, mask_ratio: float = 0.0) -> torch.Tensor:
         """context: [B, T, L, C] -> z_ctx: [B, D]. This is the extractable
         hidden/context vector referenced in task 4 of the assignment."""
-        return self.context_encoder(context)
+        return self.context_encoder(context, mask_ratio=mask_ratio)
 
     def forward(self, context: torch.Tensor, future_full: dict[int, torch.Tensor]):
         """
@@ -188,7 +197,9 @@ class WeatherJEPA(nn.Module):
           - forecast: decoded standardized ABS_HUMIDITY profile [B, L]
           - jepa_loss_terms: (z_hat, stopgrad(z_target)) for the representation loss
         """
-        z_ctx = self.encode_context(context)  # [B, D]
+        # Context is masked at training time; target encoder always sees the
+        # unmasked future profile (it's the prediction target, not the input).
+        z_ctx = self.encode_context(context, mask_ratio=self.ctx_mask_ratio)  # [B, D]
 
         out = {"z_ctx": z_ctx, "per_horizon": {}}
         for hours, idx in HORIZON_TO_IDX.items():
@@ -216,9 +227,21 @@ def variance_loss(z: torch.Tensor, target_std: float = 0.5) -> torch.Tensor:
     return torch.mean(torch.relu(target_std - std))
 
 
+def covariance_loss(z: torch.Tensor) -> torch.Tensor:
+    """Penalize off-diagonal covariance between embedding dimensions.
+
+    Stops a subtler collapse where variance is fine but dimensions are
+    redundant (all encoding the same signal). VICReg-style."""
+    z = z - z.mean(dim=0, keepdim=True)
+    cov = (z.T @ z) / (z.size(0) - 1)
+    off_diag = cov - torch.diag(torch.diag(cov))
+    return off_diag.pow(2).sum() / z.size(1)
+
+
 def jepa_and_forecast_loss(model_out: dict, targets: dict[int, torch.Tensor],
                             jepa_weight: float = 1.0, forecast_weight: float = 1.0,
-                            anti_collapse_weight: float = 0.0):
+                            anti_collapse_weight: float = 0.0,
+                            covariance_weight: float = 0.0):
     """
     Combines:
       - representation-space JEPA loss: MSE on L2-normalized embeddings
@@ -226,8 +249,9 @@ def jepa_and_forecast_loss(model_out: dict, targets: dict[int, torch.Tensor],
         angular diversity — embeddings can't all point the same way.
       - value-space forecast loss: MSE(decoded profile, true standardized profile)
       - anti-collapse variance loss: pushes per-dim std above target_std
+      - covariance decorrelation loss: penalizes redundant embedding dimensions
     """
-    total_jepa, total_fcst, total_var = 0.0, 0.0, 0.0
+    total_jepa, total_fcst, total_var, total_cov = 0.0, 0.0, 0.0, 0.0
     per_horizon_fcst = {}
     for hours, d in model_out["per_horizon"].items():
         z_hat_norm = nn.functional.normalize(d["z_hat"], dim=-1)
@@ -239,12 +263,15 @@ def jepa_and_forecast_loss(model_out: dict, targets: dict[int, torch.Tensor],
         per_horizon_fcst[hours] = fcst_term.detach()
         if anti_collapse_weight > 0:
             total_var = total_var + variance_loss(d["z_hat"])
+        if covariance_weight > 0:
+            total_cov = total_cov + covariance_loss(d["z_hat"])
 
-    loss = jepa_weight * total_jepa + forecast_weight * total_fcst + anti_collapse_weight * total_var
+    loss = jepa_weight * total_jepa + forecast_weight * total_fcst + anti_collapse_weight * total_var + covariance_weight * total_cov
     parts = {
         "jepa": total_jepa.detach(),
         "forecast": total_fcst.detach(),
         "variance": total_var.detach() if isinstance(total_var, torch.Tensor) else torch.tensor(0.0),
+        "covariance": total_cov.detach() if isinstance(total_cov, torch.Tensor) else torch.tensor(0.0),
         "per_horizon": per_horizon_fcst,
     }
     return loss, parts

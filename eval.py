@@ -159,6 +159,7 @@ def main():
         n_layers=ckpt_args["n_layers"],
         max_ctx_len=ckpt_args["ctx_len"],
         ema_momentum=ckpt_args.get("ema_momentum", 0.996),
+        ctx_mask_ratio=ckpt_args.get("ctx_mask_ratio", 0.0),
     ).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()

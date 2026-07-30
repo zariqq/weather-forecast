@@ -51,7 +51,9 @@ def main():
     ap.add_argument("--eval-start", required=True)
     ap.add_argument("--eval-end", required=True)
     ap.add_argument("--horizon", type=int, default=3, choices=[3, 6])
-    ap.add_argument("--max-samples", type=int, default=1500)
+    ap.add_argument("--max-samples", type=int, default=5000)
+    ap.add_argument("--shuffle/--no-shuffle", default=True,
+                    help="Randomly subsample across full eval range (default: on)")
     ap.add_argument("--out-prefix", default="embeddings")
     args = ap.parse_args()
 
@@ -89,27 +91,40 @@ def main():
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
+    # Choose which samples to extract. If shuffle, randomly sub-sample
+    # across the full eval range; otherwise take the first N (fast debug).
+    n_total = len(ds)
+    n_use = min(args.max_samples, n_total)
+    if args.shuffle:
+        rng = np.random.default_rng(42)
+        sample_indices = sorted(rng.choice(n_total, size=n_use, replace=False))
+    else:
+        sample_indices = list(range(n_use))
+
     embeds, months = [], []
     horizon_idx_val = HORIZON_TO_IDX[args.horizon]
 
     with torch.no_grad():
-        sample_i = 0
-        for context, _future_full, _targets, _raw in loader:
-            if sample_i >= args.max_samples:
-                break
-            context = context.to(device)
+        for idx in range(0, n_use, 64):
+            batch_indices = sample_indices[idx: idx + 64]
+            batch = [ds[i] for i in batch_indices]
+            context = torch.stack([b["context"] for b in batch]).to(device)
             z_ctx = model.encode_context(context)
-            idx = torch.full(
-                (z_ctx.size(0),), horizon_idx_val, dtype=torch.long, device=device
+            z_hat = model.predictor(
+                z_ctx,
+                torch.full((len(batch_indices),), horizon_idx_val, dtype=torch.long, device=device),
             )
-            z_hat = model.predictor(z_ctx, idx)
             embeds.append(z_hat.cpu().numpy())
-            sample_i += context.size(0)
+            for i in batch_indices:
+                t = ds.index[i]
+                months.append(
+                    datetime.datetime.fromtimestamp(
+                        grid.timestamps[t + ds.horizon_steps[args.horizon]],
+                        tz=datetime.timezone.utc,
+                    ).month
+                )
 
-    embeds = np.concatenate(embeds, axis=0)[: args.max_samples]
-
-    # Month-of-year color coding, purely for the plot (not used by the model)
-    sample_timestamps = grid.timestamps[ds.index][: len(embeds)]
+    embeds = np.concatenate(embeds, axis=0)[:n_use]
     months = np.array(
         [
             datetime.datetime.fromtimestamp(t, tz=datetime.timezone.utc).month
@@ -141,8 +156,10 @@ def main():
     plt.savefig(f"{args.out_prefix}_tsne.png", dpi=150)
     plt.close()
 
-    # --- cosine similarity heatmap over a subset ---
-    subset = embeds[: min(200, len(embeds))]
+    # --- cosine similarity heatmap over a random subset ---
+    rng = np.random.default_rng(123)
+    heatmap_idx = rng.choice(len(embeds), size=min(200, len(embeds)), replace=False)
+    subset = embeds[heatmap_idx]
     norm = subset / (np.linalg.norm(subset, axis=1, keepdims=True) + 1e-8)
     cos_sim = norm @ norm.T
     plt.figure(figsize=(6, 5))
